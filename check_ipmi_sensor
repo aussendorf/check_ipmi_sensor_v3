@@ -1,3 +1,4 @@
+#!/usr/local/groundwork/perl/bin/perl
 #!/usr/bin/perl
 # check_ipmi_sensor: Nagios/Icinga plugin to check IPMI sensors
 #
@@ -33,6 +34,10 @@ use strict;
 use warnings;
 use Getopt::Long qw(:config no_ignore_case);
 use IPC::Run qw( run ); #interact with processes
+use Date::Parse qw(str2time);
+use Date::Format qw(time2str);
+use File::stat;
+use Digest::MD5 qw(md5_hex);
 ################################################################################
 # set text variables
 our $check_ipmi_sensor_version = "3.10";
@@ -53,6 +58,8 @@ check_ipmi_sensor -H <hostname>
   [-O <FreeIPMI options>] [-b] [-T <sensor type>] [-x <sensor id>]
   [-i <sensor id>] [-o zenoss] [-D <protocol LAN version>] [-h] [-V]
   [-fc <num_fans>] [--fru] [--nosel] [--nothresholds] [--nosudo]
+  [-sc|--since <timestamp>]
+  [-c <command pipe>] [-p <prefix>]
   [-v|-vv|-vvv]
 EOT
 }
@@ -139,6 +146,23 @@ sub get_help{
   [--nosel]
        turn off system event log checking via ipmi-sel. If there are
        unintentional entries in SEL, use 'ipmi-sel --clear'.
+  [-c <command pipe>]
+       Submit check result(s) as passive check to the given Nagios/Icinga
+       command pipe
+  [-p <prefix>]
+       Proceed checks as "pile of services", this means for any given type a single
+       check result is computed and submitted as passive check (requires -c set).
+       The value <prefix> ist used as service check name prefix, the sensor type will be
+       append to this prefix.
+       The script itself can be called as active check and will become critical, if
+       connection to host cannot be established. In this case no passive service checks
+       will be submitted. 
+  [-sc|--since <timestamp>]
+       Only evluate events since <timestamp>. Use the special timestamp 'last'
+       to only consider events since last run. In this case the plugin will
+       save the timestamp of a run in a unique tmp-file for every host and
+       option string. If no timestamp file is available (ususally on the first
+       call), all events will be evaluated and the timestamp created.
   [-sx|--selexclude <sel exclude file>]
        use a sel exclude file to exclude entries from the system event log.
        Specify name and type pipe delimitered in this file to exclude an entry,
@@ -290,6 +314,7 @@ sub get_sel{
 	my @selcmd = @{(shift)};
 	my $verbosity = shift;
 	my @sel_sensor_types = @{(shift)};
+	my $since_time = shift;
 	my $sel;
 	if(-e '/usr/sbin/ipmi-sel'){
 		$sel = '/usr/sbin/ipmi-sel';
@@ -306,6 +331,10 @@ sub get_sel{
 	}
 	push @selcmd, '--output-event-state', '--interpret-oem-data', '--entity-sensor-names';
 	push @selcmd, '--sensor-types=' . join(',', @sel_sensor_types);
+	if( $since_time > 0 ){
+		my $daterange = time2str ("%m/%d/%Y",$since_time) . '-' . time2str ("%m/%d/%Y", time);
+		push @selcmd, "--date-range=$daterange";
+	}
 	my $seloutput;
 	my $returncode;
 	run \@selcmd, '>&', \$seloutput;
@@ -324,6 +353,7 @@ sub get_sel{
 		print "  output of FreeIPMI:\n";
 		print "$seloutput";
 	}
+	
 	return split('\n', $seloutput);
 }
 
@@ -332,9 +362,17 @@ sub parse_sel{
 	my $verbosity = shift;
 	my $sel_xfile = shift;
 	my $sel_sensor_types = shift;
-	my @seloutput = get_sel($selcmd, $verbosity, $sel_sensor_types);
+	my $since_time = shift;
+	my @seloutput = get_sel($selcmd, $verbosity, $sel_sensor_types, $since_time);
 	@seloutput = map { [ map { s/^\s*//; s/\s*$//; $_; } split(m/\|/, $_) ] } @seloutput;
 	my $header = shift(@seloutput);
+	my $startdate = '';
+	my $starttime = '';
+
+	if($since_time > 0){
+		$startdate = time2str ("%b-%d-%Y",$since_time); # like Dec-23-2015
+		$starttime = time2str ("%H:%M:%S",$since_time);  # like 15:26:54
+	}
 	
 	my @sel_rows;
 	foreach my $row (@seloutput){
@@ -344,7 +382,10 @@ sub parse_sel{
 			$curr_row{$key} = $row->[$i];
 		}
 		if(!(exclude_with_file($sel_xfile, $curr_row{'name'}, $curr_row{'type'}))){
-			push @sel_rows, \%curr_row;
+			# date-range operates only on full dates, we need care about the time and eventually remove entries
+			if (not (($curr_row{'date'} eq $startdate) and ($curr_row{'time'} lt $starttime))){
+				push @sel_rows, \%curr_row;
+			} 
 		}
 	}
 	return \@sel_rows;
@@ -417,7 +458,15 @@ MAIN: {
 	my $abort_text = '';
 	my $zenoss = 0;
 	my @sel_sensor_types;
+	my $sel_timestamp = '';
+	my $timestamp_dir = '/var/tmp/check_ipmi/';
 	my $simulate = '';
+	my $commandpipe = '';
+    	my $batchjob = 0;
+    	my %batchresult = (); # hash for batchresults, takes sensor-type as key, exitcode as value
+    	my %batchmessage= (); # hash for batchresult messages, takes sensor-type as key, message as value
+    	my %batchperf = (); # hash for batchresults perfstrings, takes sensor-type as key, perfstring as value
+	
 	my ($use_fru, $no_sel, $no_sudo, $use_thresholds, $no_thresholds, $sel_xfile, $s_xfile);
 
 	#read in command line arguments and init hash variables with the given values from argv
@@ -439,13 +488,16 @@ MAIN: {
 		'vv'				=> sub{$verbosity=2},
 		'vvv'				=> sub{$verbosity=3},
 		'x|exclude=s'		=> \@ipmi_xlist,
+		'sc|since=s'		=> \$sel_timestamp,
 		'sx|selexclude=s'	=> \$sel_xfile,
 		'xx|sexclude=s'		=> \$s_xfile,
 		'i|include=s'		=> \@ipmi_ilist,
 		'o|outformat=s'		=> \$ipmi_outformat,
 		'fc|fancount=i'		=> \$fan_count,
-		'D=s'				=> \$lanVersion,
-		's=s'				=> \$simulate,
+		'D=s'			=> \$lanVersion,
+		's=s'			=> \$simulate,
+        	'c=s'               	=> \$commandpipe, # and submit results as passive check
+        	'p=s'                 	=> \$batchjob,    # process on check per type, service check name as prefix
 		'h|help'			=>
 			sub{print STDOUT get_version();
 				print STDOUT "\n";
@@ -595,6 +647,21 @@ MAIN: {
 	if($use_thresholds && !$no_thresholds){
 		push @getstatus, '--output-sensor-thresholds';
 	}
+	# if  --since for eventlog is set to 'last', check for timestamp file
+	my $since_unix_timestamp = 0;
+	my $timestamp_file = '';
+	if($sel_timestamp eq 'last') {
+		$timestamp_file = "$timestamp_dir/check_ipmi.$ipmi_host." . md5_hex(join('',@ARGV_SAVE));
+		if(-e $timestamp_file){
+			$since_unix_timestamp = stat($timestamp_file)->mtime;
+		}
+	}
+	elsif($sel_timestamp gt ''){
+		# my $parser = DateTime::Format::Strptime->new( pattern => '%Y-%m-%d %H:%M:%S' );
+		# Format is like  | Jan-08-2015 | 18:50:08 |
+		$since_unix_timestamp = str2time ($sel_timestamp);
+		print "time: $sel_timestamp, unix: $since_unix_timestamp\n";
+	}
 
 ################################################################################
 	#execute status command and redirect stdout and stderr to ipmioutput
@@ -617,7 +684,12 @@ MAIN: {
 	}
 	my $seloutput;
 	if(!$no_sel){
-		$seloutput = parse_sel(\@selcmd, $verbosity, $sel_xfile, \@sel_sensor_types);
+		$seloutput = parse_sel(\@selcmd, $verbosity, $sel_xfile, \@sel_sensor_types, $since_unix_timestamp);
+		# touch timestamp file, if defined
+		if($timestamp_file gt ''){
+			open my $fh, '>', $timestamp_file or print "WARNING: Can't touch timestamp file $timestamp_file\n";
+			close $fh;
+		}
 	}
 ################################################################################
 # print debug output when verbosity is set to 3 (-vvv)
@@ -661,13 +733,18 @@ MAIN: {
 			print "   ", join(' ', @getstatus), "\n";
 			exit(3);
 		}
-		#print desired filter types
-		if ( @ipmi_sensor_types ){
-			print "Sensor Type(s) ", join(', ', @ipmi_sensor_types), " Status: ";
-		}
-		else{
-			print "IPMI Status: ";
-		}
+		if (not $batchjob ){
+			#print desired filter types
+			if ( @ipmi_sensor_types ){
+				print "Sensor Type(s) ", join(', ', @ipmi_sensor_types), " Status: ";
+			}
+			else{
+				print "IPMI Status: ";
+			}
+		} else {
+            		print "OK - IPMI batch job executed\n";
+        	}
+ 
 		#split at newlines, fetch array with lines of output
 		my @ipmioutput = split('\n', $ipmioutput);
 		
@@ -722,13 +799,21 @@ MAIN: {
 		my $perf = '';#performance sensor
 		my $curr_fans = 0;
 		foreach my $row ( @ipmioutput2 ){
+            		my $partresult = 0;
 			if( $zenoss ){
 				$row->{'name'} =~ s/ /_/g;
 			}
+            		$row->{'type'} =~  s/ /_/g;
 			#check for warning sensors
 			if ( $row->{'state'} ne 'Nominal' && $row->{'state'} ne 'N/A' ){
-				$exit = 1 if $exit < 1;
-				$exit = 2 if $exit < 2 && $row->{'state'} ne 'Warning';
+				if ($exit < 1){
+					$exit = 1;
+					$partresult = 1;
+				}
+				if ($exit < 2 && $row->{'state'} ne 'Warning') {
+					$exit = 2;
+					$partresult = 2;
+				}
 				#don't insert a , the first time
 				$w_sensors .= ", " unless $w_sensors eq '';
 				$w_sensors .= "$row->{'name'} = $row->{'state'}";
@@ -741,6 +826,22 @@ MAIN: {
 					}
 				}
 			}
+			if ($batchjob && defined ($row->{'type'})) {
+                    		if ((not defined $batchresult{$row->{'type'}}) or ($batchresult{$row->{'type'}} < $partresult)) {
+                        		$batchresult{$row->{'type'}} = $partresult;
+                    		}
+                    		if (not defined $batchmessage{$row->{'type'}}) {
+                        		$batchmessage{$row->{'type'}} = "$row->{'name'} = $row->{'state'}";
+                    		} else {
+                        		$batchmessage{$row->{'type'}} .= ", $row->{'name'} = $row->{'state'}";
+                    		}
+                    		if (not defined $batchperf{$row->{'type'}}) {  $batchperf{$row->{'type'}} = ''};
+                    		if ( $row->{'units'} ne 'N/A' ) {
+                        		my $val = $row->{'reading'};
+                        		$batchperf{$row->{'type'}} .= qq|'$row->{'name'}'=$val |;    
+                    		}
+			}
+
 			if ( $row->{'units'} ne 'N/A' ){
 				my $val = $row->{'reading'};
 				my $perf_data;
@@ -786,12 +887,21 @@ MAIN: {
 			}
 		}
 		foreach my $row (@{$seloutput}){
+            		my $partresult=0;
 			if( $zenoss ){
 				$row->{'name'} =~ s/ /_/g;
 			}
+            		$row->{'type'} =~  s/ /_/g;
 			if ($row->{'state'} ne 'Nominal'){
-				$exit = 1 if $exit < 1;
-				$exit = 2 if $exit < 2 && $row->{'state'} ne 'Warning';
+				print "found: $row->{'name'} = $row->{'state'}\n";
+				if ($exit < 1){
+					$exit = 1;
+					$partresult = 1;
+				}
+				if ($exit < 2 && $row->{'state'} ne 'Warning'){
+					$exit = 2;
+					$partresult = 2;
+				}
 				$w_sensors .= ", " unless $w_sensors eq '';
 				$w_sensors .= "$row->{'name'} = $row->{'state'}";
 				if( $verbosity ){
@@ -800,10 +910,28 @@ MAIN: {
 					}
 				}
 			}
+			print "Evaluating  $row->{'name'}  = $row->{'state'}, type $row->{'type'}\n";
+			if ($batchjob && defined ($row->{'type'})) {
+                    		if ((not defined $batchresult{$row->{'type'}}) or ($batchresult{$row->{'type'}} < $partresult)) {
+                        		$batchresult{$row->{'type'}} = $partresult;
+                    		}
+                    		if (not defined $batchmessage{$row->{'type'}}) {
+                        		$batchmessage{$row->{'type'}} = "$row->{'name'} = $row->{'state'}";
+                    		} else {
+                        		$batchmessage{$row->{'type'}} .= ", $row->{'name'} = $row->{'state'}";
+                    		}
+                    		if (not defined $batchperf{$row->{'type'}}) {  $batchperf{$row->{'type'}} = ''};
+                    		my $val = '';
+                    		$val = $row->{'reading'} if defined ($row->{'reading'});
+                    		if ( defined ($row->{'units'}) and $row->{'units'} ne 'N/A' and ( $val =~ /^-?\d+\.?\d*$/ )) {
+                        		$batchperf{$row->{'type'}} .= qq|'$row->{'name'}'=$val |;    
+                    		}
+            		}
 		}
+
 		#now check if num fans equals desired unit fans
 		if( $fan_count ){
-			if( $curr_fans < $fan_count ){
+			if( $curr_fans < $fan_count ){		$exit = 1 if $exit < 1;
 				$exit = 1 if $exit < 1;
 				$w_sensors .= ", " unless $w_sensors eq '';
 				$w_sensors .= "Fan = Warning";
@@ -823,20 +951,45 @@ MAIN: {
 			}
 		}
 		$perf = substr($perf, 0, -1);#cut off the last chars
-		if ( $exit == 0 ){
-			print "OK";
+        	if (not $commandpipe) {
+			if ( $exit == 0 ){
+				print "OK";
+			}
+			elsif ( $exit == 1 ){
+				print "Warning [$w_sensors]";
+			}
+			else{
+				print "Critical [$w_sensors]";
+			}
+			if( $use_fru && defined($serial_number)){
+				print " ($serial_number)";
+			}
+			print " | ", $perf if $perf ne '';
+			print "\n";
 		}
-		elsif ( $exit == 1 ){
-			print "Warning [$w_sensors]";
-		}
-		else{
-			print "Critical [$w_sensors]";
-		}
-		if( $use_fru && defined($serial_number)){
-			print " ($serial_number)";
-		}
-		print " | ", $perf if $perf ne '';
-		print "\n";
+        	if ($batchjob and $commandpipe) {
+            		use nagios_func ();
+            		my $argshash = {};
+            		$argshash->{h} = "$ipmi_host";
+            		my $nagios = nagios_func->new($argshash);
+            		foreach my $sensor_type ( @ipmi_sensor_types, @sel_sensor_types ) {
+                		my $message = 'UNKNOWN / nothing found';
+                		$message = $batchmessage{$sensor_type} if defined ($batchmessage{$sensor_type});
+                		my $perf = '';
+                		$perf = $batchperf{$sensor_type} if defined ($batchperf{$sensor_type});
+                		my $result = 3; # unknown by default, if not found in sensors (for sel types set OK if not found):
+				if ( grep( /^$sensor_type$/, @sel_sensor_types ) ) {
+				    	$result = 0; # assume ok, if nothing found in event log
+				}
+                		$result = $batchresult{$sensor_type} if defined ($batchresult{$sensor_type});
+                		$nagios->passive_svc_submit({
+                     			service => "$batchjob$sensor_type",
+                     			status  => "$result",
+                     			output  => "$message | $perf",
+                		});
+            		}    
+            		$exit = 0; # overall exitcode is ok, if checks are submitted
+        	}
 
 		if ( $verbosity > 1 ){
 			foreach my $row (@ipmioutput2){
